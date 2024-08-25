@@ -12,9 +12,11 @@ import openai
 import pandas
 from tqdm import tqdm
 import httpx
-
+import tqdm
 from mmlu_prompt import get_init_archive, get_prompt, get_reflexion_prompt
 from utils import format_multichoice_question, random_id, bootstrap_confidence_interval, validate_and_correct_json
+import traceback
+import re
 
 OPENAI_API_BASE = os.getenv('OPENAI_API_BASE')
 
@@ -53,6 +55,32 @@ setup_logging()
 
 
 @backoff.on_exception(backoff.expo, (openai.RateLimitError, httpx.HTTPStatusError), max_tries=5)
+
+def parse_or_extract_fields(content):
+    try:
+        # First, try to parse as JSON
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # If that fails, try to extract key-value pairs
+        result = {}
+        lines = content.split('\n')
+        for line in lines:
+            match = re.match(r'"?(\w+)"?\s*:\s*(.+)', line)
+            if match:
+                key, value = match.groups()
+                result[key.strip('"')] = value.strip().strip('"').strip("'")
+        return result
+
+def extract_json_like_content(content):
+    # Try to find content enclosed in curly braces
+    match = re.search(r'\{.*\}', content, re.DOTALL)
+    if match:
+        return match.group(0)
+    return content
+
+@backoff.on_exception(backoff.expo, 
+                      (openai.RateLimitError, httpx.HTTPStatusError, httpx.ReadTimeout), 
+                      max_tries=5)
 def get_json_response_from_gpt_reflect(
         msg_list,
         model,
@@ -66,7 +94,10 @@ def get_json_response_from_gpt_reflect(
         response = client.chat.completions.create(
             model=model,
             messages=msg_list,
-            temperature=temperature, max_tokens=4096, stop=None
+            temperature=temperature,
+            max_tokens=4096,
+            stop=None,
+            timeout=300  # 5 minutes timeout
         )
         print(f"Received response: {response}")
         
@@ -81,32 +112,63 @@ def get_json_response_from_gpt_reflect(
             raise ValueError("Unable to parse or extract fields from the response")
         
         return result
+    except httpx.ReadTimeout:
+        print("Request timed out. The server took too long to respond.")
+        raise
     except httpx.HTTPStatusError as e:
         print(f"HTTP error occurred: {e}")
         raise
     except Exception as e:
         print(f"Error in get_json_response_from_gpt_reflect: {e}")
         raise
-
-@backoff.on_exception(backoff.expo, openai.RateLimitError)
-def get_json_response_from_gpt_reflect(
-        msg_list,
+@backoff.on_exception(backoff.expo, 
+                      (openai.RateLimitError, httpx.HTTPStatusError, httpx.ReadTimeout), 
+                      max_tries=5)
+def get_json_response_from_gpt(
+        msg,
         model,
-        temperature=0.8
+        system_message,
+        temperature=0.5
 ):
-    response = client.chat.completions.create(
-        model=model,
-        messages=msg_list,
-        temperature=temperature, max_tokens=4096, stop=None
-    )
-    content = response.choices[0].message.content
-    print(f"\nRaw GPT reflect response:\n{content}\n{'='*50}")
-    json_like_content = extract_json_like_content(content)
-    result = parse_or_extract_fields(json_like_content)
-    if not result:
-        print(f"Unable to parse reflect response. Raw content: {content}")
-        raise ValueError("Unable to parse or extract fields from the response")
-    return result
+    print(f"Sending request to model: {model}")
+    print(f"Temperature: {temperature}")
+    print(f"System message: {system_message}")
+    print(f"User message: {msg}")
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": msg},
+            ],
+            temperature=temperature,
+            max_tokens=4096,
+            stop=None,
+            timeout=300  # 5 minutes timeout
+        )
+        print(f"Received response: {response}")
+        
+        content = response.choices[0].message.content
+        print(f"\nRaw GPT response:\n{content}\n{'='*50}")
+        
+        json_like_content = extract_json_like_content(content)
+        result = parse_or_extract_fields(json_like_content)
+        
+        if not result:
+            print(f"Unable to parse response. Raw content: {content}")
+            raise ValueError("Unable to parse or extract fields from the response")
+        
+        return result
+    except httpx.ReadTimeout:
+        print("Request timed out. The server took too long to respond.")
+        raise
+    except httpx.HTTPStatusError as e:
+        print(f"HTTP error occurred: {e}")
+        raise
+    except Exception as e:
+        print(f"Error in get_json_response_from_gpt: {e}")
+        raise
 
 class LLMAgentBase():
     """
@@ -182,6 +244,7 @@ class AgentSystem():
     def __init__(self) -> None:
         pass
 
+
 def search(args):
     file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
     if os.path.exists(file_path):
@@ -195,29 +258,8 @@ def search(args):
         archive = get_init_archive()
         start = 0
 
-    for solution in archive:
-        if 'fitness' in solution:
-            continue
-
-        solution['generation'] = "initial"
-        print(f"============Initial Archive: {solution['name']}=================")
-        try:
-            acc_list = evaluate_forward_fn(args, solution["code"])
-        except Exception as e:
-            print("During evaluating initial archive:")
-            print(e)
-            continue
-
-        fitness_str = bootstrap_confidence_interval(acc_list)
-        solution['fitness'] = fitness_str
-
-        # save results
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, 'w') as json_file:
-            json.dump(archive, json_file, indent=4)
-
     for n in range(start, args.n_generation):
-        print(f"============Generation {n + 1}=================")
+        print(f"\n============Generation {n + 1}=================")
         system_prompt, prompt = get_prompt(archive)
         msg_list = [
             {"role": "system", "content": system_prompt},
@@ -225,21 +267,32 @@ def search(args):
         ]
         try:
             next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+            print(f"Initial solution for generation {n+1}: {next_solution}")
 
             Reflexion_prompt_1, Reflexion_prompt_2 = get_reflexion_prompt(archive[-1] if n > 0 else None)
             # Reflexion 1
-            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "assistant", "content": json.dumps(next_solution)})
             msg_list.append({"role": "user", "content": Reflexion_prompt_1})
             next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+            print(f"Solution after Reflexion 1 for generation {n+1}: {next_solution}")
             # Reflexion 2
-            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "assistant", "content": json.dumps(next_solution)})
             msg_list.append({"role": "user", "content": Reflexion_prompt_2})
             next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
-        except Exception as e:
-            print("During LLM generate new solution:")
-            print(e)
-            n -= 1
+            print(f"Final solution for generation {n+1}: {next_solution}")
+        except httpx.ReadTimeout:
+            print(f"Timeout occurred during generation {n+1}. Moving to next generation.")
             continue
+        except Exception as e:
+            print(f"Error during generation {n+1}: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            # Fallback mechanism
+            next_solution = {
+                "thought": "Fallback due to server error",
+                "name": f"Fallback Agent {n+1}",
+                "code": "def forward(self, taskInfo):\n    return taskInfo"
+            }
+            print(f"Using fallback solution: {next_solution}")
 
         acc_list = []
         for _ in range(args.debug_max):
@@ -251,17 +304,15 @@ def search(args):
             except Exception as e:
                 print("During evaluation:")
                 print(e)
-                msg_list.append({"role": "assistant", "content": str(next_solution)})
+                msg_list.append({"role": "assistant", "content": json.dumps(next_solution)})
                 msg_list.append({"role": "user", "content": f"Error during evaluation:\n{e}\nCarefully consider where you went wrong in your latest implementation. Using insights from previous attempts, try to debug the current code to implement the same thought. Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'"})
                 try:
                     next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
                 except Exception as e:
-                    print("During LLM generate new solution:")
-                    print(e)
+                    print(f"During LLM generate new solution: {e}")
                     continue
                 continue
         if not acc_list:
-            n -= 1
             continue
 
         fitness_str = bootstrap_confidence_interval(acc_list)
